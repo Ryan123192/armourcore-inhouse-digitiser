@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local virtualenv
+.venv/
+venv/
+
+# Pipeline outputs - regenerated on every run, never commit
+data/outputs/
+data/_gui_tmp*
+**/_gui_tmp*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store

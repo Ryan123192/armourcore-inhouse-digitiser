@@ -1,0 +1,7 @@
+# In-House CDS Digitiser - runtime dependencies.
+# Pinned for reproducibility across work PCs.  Bump in lockstep.
+opencv-python==4.10.0.84
+numpy==1.26.4
+pillow==10.4.0
+pymupdf==1.24.10        # PDF -> PNG conversion for PDF inputs
+scikit-image==0.24.0    # Sauvola adaptive binarisation (phase2/pencil_enhance_v2)
