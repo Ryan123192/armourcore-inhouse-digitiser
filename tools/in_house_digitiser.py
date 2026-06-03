@@ -27,11 +27,14 @@ Grey placeholders sit in every slot until the run populates them.
 """
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from tkinter import (Tk, Toplevel, Frame, Button, Label, Entry, Canvas,
-                     StringVar, filedialog, messagebox)
+                     StringVar, BooleanVar, Checkbutton, filedialog,
+                     messagebox)
 from tkinter import font as tkfont
 from tkinter import ttk
 
@@ -44,7 +47,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from vectorise_cli import run_pipeline
+from vectorise_cli import run_pipeline, default_cache_dir
 import armourcore_cds.phase1.marker_rectify_scan as _p1
 
 # ---------------------------------------------------------------------------
@@ -117,10 +120,17 @@ class InHouseDigitiser:
         self.input_path: Path | None = None
         self.original_image_bgr: np.ndarray | None = None
         self.oriented_image_bgr: np.ndarray | None = None  # the thing we run
-        self.last_out_dir: Path | None = None
+        self.last_svg_path: Path | None = None
+        self.last_diag_dir: Path | None = None   # location of the preview source set
         self.paper_w, self.paper_h = PRESET_LARGE
         self.paper_label = "Large CDS (600 x 500)"
-        self.output_root: Path = REPO / "data/outputs/InhouseProduction"
+        # Default output folder = user's Desktop if it exists, else home.
+        # Keeps the produced SVG out of the repo by default.
+        desktop = Path.home() / "Desktop"
+        self.output_root: Path = desktop if desktop.exists() else Path.home()
+        # Per-user TEMP cache for working files + preview sources.
+        # Wiped + repopulated by the pipeline on every run.
+        self.cache_dir: Path = default_cache_dir()
         self._thumbs: list[ImageTk.PhotoImage] = []  # keep refs from GC
 
         # ttk progressbar styling
@@ -285,6 +295,23 @@ class InHouseDigitiser:
                                   fg=MUTED, font=self.f_small,
                                   wraplength=380, justify="left")
         self.output_label.pack(anchor="w", pady=(4, 0))
+
+        # Diagnostics toggle.  Defaults OFF: each run produces ONE file -
+        # <stem>_traced.svg containing the rectified template raster +
+        # editable vector paths, sized in real mm so Affinity Publisher
+        # imports it without rescaling.  Ticking the box ALSO writes a
+        # .diagnostics/ subfolder with every intermediate PNG + JSON +
+        # the per-corner detection crops, for issue analysis.
+        self.write_diagnostics = BooleanVar(value=False)
+        diag_row = Frame(left, bg=BG); diag_row.pack(anchor="w", pady=(8, 0))
+        Checkbutton(
+            diag_row, text="Save diagnostics (.diagnostics/ subfolder)",
+            variable=self.write_diagnostics,
+            bg=BG, fg=MUTED, font=self.f_small,
+            activebackground=BG, activeforeground=FG,
+            selectcolor=BG_CARD, bd=0, highlightthickness=0,
+            anchor="w",
+        ).pack(anchor="w")
 
         # ---- VECTORISE ----
         self.run_btn = self._btn(left, "VECTORISE", self.run_pipeline_threaded,
@@ -501,8 +528,9 @@ class InHouseDigitiser:
                 import fitz
                 doc = fitz.open(str(path))
                 pix = doc[0].get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72))
-                png_path = REPO / "data/outputs/InhouseProduction/_gui_tmp.png"
-                png_path.parent.mkdir(parents=True, exist_ok=True)
+                # PDF render lives in the per-user cache, not the repo.
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                png_path = self.cache_dir / "pdf_render.png"
                 pix.save(str(png_path))
                 img = cv2.imread(str(png_path))
             except Exception as exc:
@@ -651,30 +679,49 @@ class InHouseDigitiser:
 
     def _run(self):
         try:
-            tmp_dir = REPO / "data/outputs/InhouseProduction/_gui_tmp"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            tmp_png = tmp_dir / f"{self.input_path.stem}.png"
+            # The oriented working image must live OUTSIDE cache_dir
+            # because the pipeline wipes that folder at the start of
+            # every run.  We park it as a sibling of cache_dir in the
+            # same TEMP root - that one path survives between runs.
+            stem = self.input_path.stem
+            self.cache_dir.parent.mkdir(parents=True, exist_ok=True)
+            tmp_png = self.cache_dir.parent / "ArmourCoreDigitiser_input.png"
             cv2.imwrite(str(tmp_png), self.oriented_image_bgr)
+
             _p1.PAPER_W_MM = self.paper_w
             _p1.PAPER_H_MM = self.paper_h
-            out_dir, verdict = run_pipeline(
-                tmp_png, self.output_root,
-                forced_route=None, rectifier="scan", ts_prefix="gui",
+
+            final_svg = self.output_root / f"{stem}_Digitised.svg"
+            diag_save_to = (
+                self.output_root / f"{stem}_diagnostics"
+                if self.write_diagnostics.get() else None
+            )
+            svg_path, verdict = run_pipeline(
+                tmp_png,
+                final_svg_path=final_svg,
+                working_dir=self.cache_dir,
                 paper_w_mm=self.paper_w, paper_h_mm=self.paper_h,
                 progress_callback=self._on_pipeline_progress,
+                write_diagnostics=self.write_diagnostics.get(),
+                diag_save_to=diag_save_to,
             )
-            self.last_out_dir = out_dir
-            self.root.after(0, lambda: self._done_ok(out_dir, verdict))
+            self.last_svg_path = svg_path
+            self.last_diag_dir = self.cache_dir
+            self.root.after(0, lambda: self._done_ok(svg_path, verdict))
         except Exception as exc:
             err = str(exc)
             self.root.after(0, lambda: self._done_err(err))
 
-    def _done_ok(self, out_dir, verdict):
+    def _done_ok(self, svg_path, verdict):
         self.progress.stop()
         self.progress.pack_forget()
         self.repeat_btn.config(state="normal")
-        self.status.config(text=f"Done.  Verdict: {verdict}\n{out_dir.name}")
-        self._show_all_stages(out_dir)
+        self.status.config(
+            text=f"Done.  Verdict: {verdict}\n{svg_path.name}")
+        # Preview source = the per-user cache, which persists between
+        # runs (next vectorise wipes + repopulates).  So the preview
+        # tiles stay visible after the run completes.
+        self._show_all_stages(self.cache_dir)
         self._set_done_state()
 
     def _done_err(self, err):
@@ -686,10 +733,12 @@ class InHouseDigitiser:
         messagebox.showerror("Pipeline failed", err)
 
     def open_folder(self):
-        if self.last_out_dir is None:
+        """Open the user-selected output folder.  That's where the
+        production SVG (and optional <stem>_diagnostics/) lives."""
+        if self.output_root is None:
             return
         import os
-        os.startfile(str(self.last_out_dir))
+        os.startfile(str(self.output_root))
 
 
 def main():

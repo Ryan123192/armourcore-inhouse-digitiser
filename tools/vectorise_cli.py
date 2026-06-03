@@ -1,30 +1,35 @@
 """One-shot CLI for the In-House CDS tracing workflow (scan inputs).
 
-Each run goes into a TIMESTAMPED folder under
-``data/outputs/InhouseProduction/<YYYYMMDD-HHMMSS>_<stem>/`` so a
-back-and-forth iteration produces an ordered history, not a soup.
+Production output is a SINGLE file dropped directly into the chosen
+output folder:
 
-Output per run:
-    diagnostic.png      single 6-panel page
-    vectors.svg         production SVG (REAL paths only)
-    vectors_all.svg     includes anything the classifier flagged
-    report.json         machine-readable verdict + counts
-    rectified.png       phase 1 output
-    cleaned.png         phase 2 cleaned image
-    overlay.png         vectors on white
-    vector_boxes.png    bounding boxes around detected vectors
-    classified.png      path-coloured by classifier category
-    _corner_TL/TR/BR/BL.png   per-corner debug crops
+    <output-folder>/<stem>_Digitised.svg
+
+The SVG contains the rectified template raster + node-editable vector
+paths, sized in real mm.  Paste it into Affinity Publisher and it lands
+at exactly e.g. 600 mm x 500 mm with no rescale needed.
+
+All intermediate diagnostic artefacts are written to a per-user TEMP
+cache (``%TEMP%/ArmourCoreDigitiser/``) that gets wiped and rewritten
+on every run.  The GUI uses this cache to populate preview tiles - and
+because the cache persists between runs, the previews stay visible
+until the NEXT vectorise overwrites them.
+
+With ``--diag`` the same diagnostic set is ALSO copied into a
+``<stem>_diagnostics/`` folder next to the production SVG.
 
 Usage:
     python tools/vectorise_cli.py path/to/scan.png
     python tools/vectorise_cli.py path/to/scan.png --paper-w 900 --paper-h 500
+    python tools/vectorise_cli.py path/to/scan.png --diag --out C:\\out
 """
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +38,12 @@ REPO = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "tools"))
+
+
+def default_cache_dir() -> Path:
+    """Per-user TEMP cache for working files + GUI preview sources.
+    Wiped at the start of every pipeline run."""
+    return Path(tempfile.gettempdir()) / "ArmourCoreDigitiser"
 
 import cv2
 import numpy as np
@@ -43,7 +54,9 @@ from armourcore_cds.phase1.marker_rectify_scan import (
 from armourcore_cds.phase2.clean_scan import (
     clean_scan_pencil, strip_outer_border,
 )
-from armourcore_cds.phase3.vectorise import write_svg, render_vector_overlay
+from armourcore_cds.phase3.vectorise import (
+    write_svg, write_combined_svg, render_vector_overlay,
+)
 from armourcore_cds.phase3.vectorise_pencil import extract_vector_paths_pencil
 from armourcore_cds.phase3.path_classifier import (
     classify_paths, render_classified, category_counts,
@@ -147,20 +160,50 @@ def build_diagnostic_page(stages: list[tuple[np.ndarray, str, str]],
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(image_path: Path, out_root: Path,
-                forced_route: str | None = None,
-                rectifier: str = "scan",
-                ts_prefix: str | None = None,
+def run_pipeline(image_path: Path,
+                final_svg_path: Path,
+                *,
+                working_dir: Path | None = None,
                 paper_w_mm: float | None = None,
                 paper_h_mm: float | None = None,
-                progress_callback=None):
-    """``progress_callback(stage_name: str, file_path: Path)`` is called
-    after each stage writes its PNG.  The GUI uses this to populate
-    preview tiles incrementally instead of all at once at the end.
-    Stages fired: ``corners``, ``corner_TL``, ``corner_TR``,
-    ``corner_BL``, ``corner_BR``, ``rectified``, ``cleaned``,
-    ``vector_boxes``, ``overlay``.  Failures inside the callback are
-    swallowed - it must never break the pipeline."""
+                progress_callback=None,
+                write_diagnostics: bool = False,
+                diag_save_to: Path | None = None,
+                # legacy kwargs accepted but ignored (kept for any external
+                # caller still using the old signature)
+                forced_route: str | None = None,
+                rectifier: str = "scan",
+                ts_prefix: str | None = None):
+    """Run the in-house digitiser pipeline.
+
+    Parameters
+    ----------
+    image_path : input scan / pre-converted PNG
+    final_svg_path : ABSOLUTE path the production combined SVG is
+        written to (e.g. ``C:/orders/SO1234/JobA_Digitised.svg``).
+        Parent directory is created if missing.  Overwritten if exists.
+    working_dir : where all intermediate diagnostic artefacts go (raw
+        PNGs, classifier overlays, JSON, diagnostic page, corner crops,
+        the standalone vectors.svg/vectors_all.svg).  Defaults to
+        ``%TEMP%/ArmourCoreDigitiser``.  WIPED at the start of every
+        run so old previews never accumulate.  The GUI points its
+        preview tiles at this directory so they remain visible until
+        the next run.
+    progress_callback : ``cb(stage_name, file_path)`` fires after each
+        stage writes its PNG.  Stages: ``corners``,
+        ``corner_TL/TR/BL/BR``, ``rectified``, ``cleaned``,
+        ``vector_boxes``, ``overlay``.  Exceptions swallowed.
+    write_diagnostics : if True AND ``diag_save_to`` is set, copy the
+        whole ``working_dir`` over to ``diag_save_to`` after the run.
+        If True but ``diag_save_to`` is None, the cache simply stays in
+        place (already true regardless).
+    diag_save_to : optional persistent location for the diagnostic set.
+        Typical use: ``<output_folder>/<stem>_diagnostics/``.
+
+    Returns
+    -------
+    (final_svg_path, verdict)
+    """
     # Paper size is the calibrated DESIGN area (inside the 4 markers).
     # We mutate the module globals so every downstream reference (rectify,
     # extraction mm-filters, SVG canvas) sees the selected size.  This is
@@ -184,14 +227,17 @@ def run_pipeline(image_path: Path, out_root: Path,
 
     timings = {}
     overall_t0 = time.time()
-
-    # Timestamped output folder
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    folder_name = f"{ts}_{image_path.stem}"
-    if ts_prefix:
-        folder_name = f"{ts_prefix}_{folder_name}"
-    out_dir = out_root / folder_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Working/diagnostic directory.  WIPE + recreate so previous-run
+    # files never bleed into this run's previews.
+    diag_dir = Path(working_dir) if working_dir is not None else default_cache_dir()
+    if diag_dir.exists():
+        shutil.rmtree(diag_dir, ignore_errors=True)
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    final_svg_path = Path(final_svg_path)
+    final_svg_path.parent.mkdir(parents=True, exist_ok=True)
 
     img = cv2.imread(str(image_path))
     if img is None:
@@ -215,9 +261,9 @@ def run_pipeline(image_path: Path, out_root: Path,
     rect = rr.warped
     marker_debug = rr.debug_overlay
     timings["rectify"] = time.time() - t0
-    cv2.imwrite(str(out_dir / "rectified.png"), rect)
-    cv2.imwrite(str(out_dir / "_01_corners.png"), marker_debug)
-    _notify("corners", out_dir / "_01_corners.png")
+    cv2.imwrite(str(diag_dir / "rectified.png"), rect)
+    cv2.imwrite(str(diag_dir / "_01_corners.png"), marker_debug)
+    _notify("corners", diag_dir / "_01_corners.png")
 
     # ------------------------------------------------------------------
     # Per-corner DIAGNOSTIC CROPS for the GUI preview
@@ -286,11 +332,11 @@ def run_pipeline(image_path: Path, out_root: Path,
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                        (0, 0, 0), 1, cv2.LINE_AA)
 
-            cv2.imwrite(str(out_dir / f"_corner_{tag}.png"), crop)
-            _notify(f"corner_{tag}", out_dir / f"_corner_{tag}.png")
+            cv2.imwrite(str(diag_dir / f"_corner_{tag}.png"), crop)
+            _notify(f"corner_{tag}", diag_dir / f"_corner_{tag}.png")
     except Exception:
         pass
-    _notify("rectified", out_dir / "rectified.png")
+    _notify("rectified", diag_dir / "rectified.png")
 
     # Route is fixed to "scan" / "pencil" in the in-house workflow.  The
     # cleaning + extraction stages below are tuned for light-pencil and
@@ -307,8 +353,8 @@ def run_pipeline(image_path: Path, out_root: Path,
     cleaned = clean_scan_pencil(rect)
     cleaned = strip_outer_border(cleaned, border_px=int(round(2 * px_per_mm)))
     timings["phase2"] = time.time() - t0
-    cv2.imwrite(str(out_dir / "cleaned.png"), cleaned)
-    _notify("cleaned", out_dir / "cleaned.png")
+    cv2.imwrite(str(diag_dir / "cleaned.png"), cleaned)
+    _notify("cleaned", diag_dir / "cleaned.png")
 
     # ---- Phase 2.5: trace mask (= gap-fill input) ----
     t0 = time.time()
@@ -358,9 +404,9 @@ def run_pipeline(image_path: Path, out_root: Path,
     overlay = render_vector_overlay(
         base, real_paths, mask_shape=(H, W),
         colour_bgr=(40, 180, 40), thickness=3)
-    cv2.imwrite(str(out_dir / "overlay.png"), overlay)
+    cv2.imwrite(str(diag_dir / "overlay.png"), overlay)
     annotated = render_classified(paths, classified, (H, W))
-    cv2.imwrite(str(out_dir / "classified.png"), annotated)
+    cv2.imwrite(str(diag_dir / "classified.png"), annotated)
 
     # Vector-recognition preview: COLOURED BOXES around every path we
     # decided is a vector, drawn on a faded copy of the cleaned image
@@ -376,16 +422,28 @@ def run_pipeline(image_path: Path, out_root: Path,
         cv2.rectangle(boxed, (x, y), (x + bw, y + bh), colour, 4)
         cv2.putText(boxed, cp.category, (x + 6, max(0, y - 8)),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 2, cv2.LINE_AA)
-    cv2.imwrite(str(out_dir / "vector_boxes.png"), boxed)
-    _notify("vector_boxes", out_dir / "vector_boxes.png")
-    _notify("overlay", out_dir / "overlay.png")
+    cv2.imwrite(str(diag_dir / "vector_boxes.png"), boxed)
+    _notify("vector_boxes", diag_dir / "vector_boxes.png")
+    _notify("overlay", diag_dir / "overlay.png")
 
-    write_svg(real_paths, out_dir / "vectors.svg",
+    write_svg(real_paths, diag_dir / "vectors.svg",
              mask_shape=(H, W), design_width_mm=PAPER_W_MM,
              design_height_mm=PAPER_H_MM)
-    write_svg(paths, out_dir / "vectors_all.svg",
+    write_svg(paths, diag_dir / "vectors_all.svg",
              mask_shape=(H, W), design_width_mm=PAPER_W_MM,
              design_height_mm=PAPER_H_MM)
+
+    # ---- PRODUCTION output: single SVG with embedded rectified raster
+    # + node-editable vector paths, sized in real mm.  This is the only
+    # file the operator needs - drag it into Affinity Publisher and the
+    # bounding box reads e.g. 600x500 mm directly.
+    write_combined_svg(
+        real_paths, final_svg_path,
+        rectified_bgr=rect,
+        mask_shape=(H, W),
+        design_width_mm=PAPER_W_MM,
+        design_height_mm=PAPER_H_MM,
+    )
 
     # ---- Verdict ----
     if counts["REAL"] == 0:
@@ -425,7 +483,7 @@ def run_pipeline(image_path: Path, out_root: Path,
          f"{len(real_paths)} paths to SVG"),
     ]
     diag = build_diagnostic_page(stages, header)
-    cv2.imwrite(str(out_dir / "diagnostic.png"), diag)
+    cv2.imwrite(str(diag_dir / "diagnostic.png"), diag)
 
     # ---- JSON report ----
     report = {
@@ -440,15 +498,12 @@ def run_pipeline(image_path: Path, out_root: Path,
         "real_paths": len(real_paths),
         "pencil_chosen_dilate": chosen_dilate,
         "timings_sec": {k: round(v, 3) for k, v in timings.items()},
-        "vector_svg": str(out_dir / "vectors.svg"),
+        "vector_svg": str(diag_dir / "vectors.svg"),
     }
-    (out_dir / "report.json").write_text(
+    (diag_dir / "report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8")
 
     print(f"\n=== {image_path.name} ===")
-    print(f"Folder:          {out_dir}")
-    print(f"Rectifier:       {rectifier}")
-    print(f"Route:           {route}")
     print(f"Verdict:         {verdict}")
     print(f"REAL paths:      {counts['REAL']}")
     print(f"TEXT rejected:   {counts['TEXT']}")
@@ -456,9 +511,20 @@ def run_pipeline(image_path: Path, out_root: Path,
     print(f"Time:            {total_time:.1f}s "
           f"(P1 {timings['rectify']:.1f}s + P2 {timings['phase2']:.1f}s + "
           f"P3 {timings['phase3']:.1f}s)")
-    print(f"Diagnostic:      {out_dir / 'diagnostic.png'}")
-    print(f"SVG:             {out_dir / 'vectors.svg'}")
-    return out_dir, verdict
+    print(f"SVG:             {final_svg_path}")
+
+    # Working-cache stays put either way (next run wipes it).  In
+    # diagnostic mode we ALSO copy the whole set next to the SVG so the
+    # operator has a permanent record without digging in TEMP.
+    if write_diagnostics and diag_save_to is not None:
+        diag_save_to = Path(diag_save_to)
+        if diag_save_to.exists():
+            shutil.rmtree(diag_save_to, ignore_errors=True)
+        shutil.copytree(diag_dir, diag_save_to)
+        print(f"Diagnostics:     {diag_save_to}")
+    elif write_diagnostics:
+        print(f"Diagnostics:     {diag_dir}  (cache only)")
+    return final_svg_path, verdict
 
 
 def main():
@@ -466,19 +532,32 @@ def main():
         description="In-House CDS vectoriser (scanned sheets)")
     ap.add_argument("image", type=Path, help="Path to scan / PDF render")
     ap.add_argument("--out", type=Path,
-                   default=Path("data/outputs/InhouseProduction"),
-                   help="Output root (default: data/outputs/InhouseProduction/)")
-    ap.add_argument("--tag", default=None,
-                   help="Optional prefix for the output folder name")
+                   default=Path("."),
+                   help="Folder where the production SVG is written "
+                        "(default: current directory)")
     ap.add_argument("--paper-w", type=float, default=None,
                    help="Calibrated design-area width in mm "
                         "(e.g. 600 Large, 900 X-Large)")
     ap.add_argument("--paper-h", type=float, default=None,
                    help="Calibrated design-area height in mm (e.g. 500)")
+    ap.add_argument("--diag", action="store_true",
+                   help="Also write <stem>_diagnostics/ next to the SVG "
+                        "(rectified.png, cleaned.png, classified.png, "
+                        "vector_boxes.png, overlay.png, vectors.svg, "
+                        "vectors_all.svg, diagnostic.png, report.json, "
+                        "corner crops).  Without this only the combined "
+                        "SVG is left; intermediates stay in the per-user "
+                        "cache (%TEMP%/ArmourCoreDigitiser).")
     args = ap.parse_args()
-    run_pipeline(args.image, args.out,
-                ts_prefix=args.tag,
-                paper_w_mm=args.paper_w, paper_h_mm=args.paper_h)
+
+    stem = args.image.stem
+    final_svg_path = args.out / f"{stem}_Digitised.svg"
+    diag_save_to = args.out / f"{stem}_diagnostics" if args.diag else None
+    run_pipeline(args.image,
+                final_svg_path=final_svg_path,
+                paper_w_mm=args.paper_w, paper_h_mm=args.paper_h,
+                write_diagnostics=args.diag,
+                diag_save_to=diag_save_to)
 
 
 if __name__ == "__main__":

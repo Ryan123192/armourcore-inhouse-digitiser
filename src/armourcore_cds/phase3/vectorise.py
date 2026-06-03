@@ -1250,6 +1250,96 @@ def _path_to_svg_d(
     return " ".join(parts)
 
 
+def write_combined_svg(
+    paths: list[VectorPath],
+    output_path: Path,
+    rectified_bgr: np.ndarray,
+    mask_shape: tuple[int, int],
+    design_width_mm: float,
+    design_height_mm: float,
+    stroke_colour: str = "#E63000",
+    stroke_width_mm: float = 0.3,
+) -> Path:
+    """Production output: one SVG containing BOTH the rectified raster
+    AND the editable vector paths, both in the same mm coordinate space.
+
+    Layer order (bottom -> top):
+        1. ``<image>``  : the rectified template, embedded as a PNG
+                          data-URI so the file is fully self-contained
+                          (no external asset to lose when the operator
+                          drags it into Affinity Publisher).
+        2. ``<g id="traces">`` : node-editable vector paths.
+
+    The SVG ``viewBox`` is set to ``0 0 design_width_mm design_height_mm``
+    and ``width``/``height`` use ``mm`` units, so Affinity Publisher
+    imports it at its real-world size with no rescale needed.  If the
+    operator does want to size-check, the document bbox will read
+    exactly e.g. ``600 mm x 500 mm`` for a Large CDS.
+    """
+    import base64
+    import cv2
+
+    mask_h, mask_w = mask_shape
+    scale_x = design_width_mm / mask_w
+    scale_y = design_height_mm / mask_h
+
+    # Encode rectified raster as PNG -> base64.  cv2.imencode keeps RGBA
+    # if present but we save BGR as RGB without alpha (smaller, perfectly
+    # adequate for the template background).
+    ok, png_buf = cv2.imencode(".png", rectified_bgr,
+                              [cv2.IMWRITE_PNG_COMPRESSION, 6])
+    if not ok:
+        raise RuntimeError("Failed to PNG-encode rectified image for SVG embed")
+    b64 = base64.b64encode(png_buf.tobytes()).decode("ascii")
+
+    svg = ET.Element(
+        "svg",
+        xmlns="http://www.w3.org/2000/svg",
+        viewBox=f"0 0 {design_width_mm} {design_height_mm}",
+        width=f"{design_width_mm}mm",
+        height=f"{design_height_mm}mm",
+    )
+    svg.set("xmlns:xlink", "http://www.w3.org/1999/xlink")
+
+    svg.append(ET.Comment(
+        f" ArmourCore CDS — {len(paths)} vector paths over rectified "
+        f"template ({design_width_mm}mm x {design_height_mm}mm) "
+    ))
+
+    # Layer 1: rectified raster, covering the full design canvas
+    ET.SubElement(
+        svg, "image",
+        id="rectified_template",
+        x="0", y="0",
+        width=str(design_width_mm),
+        height=str(design_height_mm),
+        preserveAspectRatio="none",
+        **{"xlink:href": f"data:image/png;base64,{b64}"},
+    )
+
+    # Layer 2: vector paths
+    g = ET.SubElement(
+        svg, "g",
+        id="traces",
+        stroke=stroke_colour,
+        **{"stroke-width": str(stroke_width_mm)},
+        fill="none",
+        **{"stroke-linecap": "round", "stroke-linejoin": "round"},
+    )
+    for i, path in enumerate(paths):
+        d = _path_to_svg_d(path, scale_x, scale_y)
+        if not d:
+            continue
+        ET.SubElement(g, "path", d=d, id=f"trace_{i:04d}")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tree = ET.ElementTree(svg)
+    ET.indent(tree, space="  ")
+    tree.write(str(output_path), encoding="unicode", xml_declaration=True)
+    return output_path
+
+
 def write_svg(
     paths: list[VectorPath],
     output_path: Path,
